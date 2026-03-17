@@ -233,7 +233,7 @@ class SourceMappingDialog(tk.Toplevel):
 
         intro = (
             "请确认新数据各列对应到老数据模板的哪个字段。"
-            " 程序已给出自动建议；如果某列不需要导入，保留“忽略该列”即可。"
+            " 程序只会按首行标题给出同名字段建议；如果某列不需要导入，保留“忽略该列”即可。"
         )
         ttk.Label(container, text=intro, wraplength=920, style="Summary.TLabel").grid(row=0, column=0, sticky="w")
 

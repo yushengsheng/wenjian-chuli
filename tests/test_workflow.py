@@ -35,6 +35,14 @@ class WorkflowTests(unittest.TestCase):
             },
         )
 
+    def test_direct_mapping_does_not_use_alias_or_semantic_guessing(self) -> None:
+        mapping = build_direct_source_to_target_mapping(
+            ["email", "telephone", "note"],
+            ["邮箱", "手机号", "备注"],
+        )
+
+        self.assertEqual(mapping, {})
+
     def test_apply_imported_sources_assigns_role_and_merges_cache(self) -> None:
         existing_source = SourceSelection("old", Path("old.xlsx"), "Sheet1", dataset_role="old")
         imported_source = SourceSelection("new", Path("new.xlsx"), "Sheet1")
@@ -148,7 +156,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(preparation.raw_dataframe_ready)
         combine_mock.assert_not_called()
 
-    def test_build_mapping_session_detects_auto_confirm_and_suggestions(self) -> None:
+    def test_build_mapping_session_detects_auto_confirm_without_loose_suggestions(self) -> None:
         old_source = SourceSelection(
             "old",
             Path("old.xlsx"),
@@ -192,7 +200,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(session.candidates[0].direct_mapping, {"email": "email", "password": "password"})
         self.assertFalse(session.candidates[1].auto_confirmed)
         self.assertFalse(session.candidates[1].can_auto_apply)
-        self.assertEqual(session.candidates[1].suggested_mapping, {"列1": "email", "列2": "password"})
+        self.assertEqual(session.candidates[1].suggested_mapping, {})
 
     def test_build_mapping_session_uses_exact_headers_even_when_template_has_no_sample_rows(self) -> None:
         old_source = SourceSelection(
@@ -231,7 +239,7 @@ class WorkflowTests(unittest.TestCase):
         session = build_mapping_session({"old": old_source, "new": new_source}, cache, [new_source])
 
         self.assertEqual(len(session.candidates), 1)
-        self.assertTrue(session.candidates[0].can_auto_apply)
+        self.assertFalse(session.candidates[0].can_auto_apply)
         self.assertEqual(
             session.candidates[0].suggested_mapping,
             {

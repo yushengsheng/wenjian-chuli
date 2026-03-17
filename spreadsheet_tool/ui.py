@@ -10,10 +10,16 @@ from tkinter import filedialog, messagebox, ttk
 import pandas as pd
 
 from .background_worker import BackgroundTaskResult, BackgroundWorker
-from .comparison import align_for_comparison, build_baseline_dataframe, preview_value as format_preview_value
+from .comparison import (
+    align_for_comparison,
+    build_baseline_dataframe,
+    get_ignored_compare_columns,
+    preview_value as format_preview_value,
+)
 from .compare_render import (
     build_comparison_info,
     compute_compare_column_widths,
+    filter_comparison_rows,
     fit_compare_text,
     marker_for_cell,
     summarize_comparison_statuses,
@@ -112,6 +118,12 @@ class SpreadsheetApp(BaseApp):
         self.compare_after_df: pd.DataFrame | None = None
         self.compare_statuses: list[str] = []
         self.compare_changed_columns: list[set[str]] = []
+        self.compare_all_before_df: pd.DataFrame | None = None
+        self.compare_all_after_df: pd.DataFrame | None = None
+        self.compare_all_statuses: list[str] = []
+        self.compare_all_changed_columns: list[set[str]] = []
+        self.compare_before_total_rows = 0
+        self.compare_after_total_rows = 0
         self.compare_column_widths: dict[str, int] = {}
         self.compare_tooltip: tk.Toplevel | None = None
         self.compare_tooltip_label: tk.Label | None = None
@@ -137,6 +149,8 @@ class SpreadsheetApp(BaseApp):
         self.poll_after_id: str | None = None
 
         self.duplicate_strategy_var = tk.StringVar(value=DUPLICATE_STRATEGIES["update_and_append"])
+        self.compare_changes_only_var = tk.BooleanVar(value=False)
+        self.compare_filter_button_text = tk.StringVar(value="仅预览变动")
         self.output_format_var = tk.StringVar(value="Excel (.xlsx)")
         self.output_sheet_var = tk.StringVar(value="处理结果")
         self.include_source_var = tk.BooleanVar(value=True)
@@ -365,7 +379,13 @@ class SpreadsheetApp(BaseApp):
         self.hide_compare_tooltip()
         self._hide_widget_tooltip()
         self.background_worker.shutdown(wait=True)
-        self.destroy()
+        super().destroy()
+
+    def destroy(self) -> None:
+        if not self.shutdown_started:
+            self._shutdown_and_destroy()
+            return
+        super().destroy()
 
     def _build_style(self) -> None:
         style = ttk.Style()
@@ -924,7 +944,24 @@ class SpreadsheetApp(BaseApp):
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(1, weight=1)
 
-        ttk.Label(parent, text="预览", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        header = ttk.Frame(parent)
+        header.grid(row=0, column=0, sticky="w")
+        ttk.Label(header, text="预览", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        self.compare_filter_button = ttk.Button(
+            header,
+            textvariable=self.compare_filter_button_text,
+            style="Compact.TButton",
+            command=self.toggle_compare_changes_only,
+        )
+        self.compare_filter_button.grid(row=0, column=1, padx=(8, 0))
+        self.register_tooltip(
+            self.compare_filter_button,
+            lambda: (
+                "当前仅显示新增、变更、移除行；点击后恢复全部预览。"
+                if self.compare_changes_only_var.get()
+                else "点击后只显示新增、变更、移除行。"
+            ),
+        )
 
         notebook = ttk.Notebook(parent)
         notebook.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
@@ -1005,6 +1042,17 @@ class SpreadsheetApp(BaseApp):
         self.compare_after_text.configure(
             xscrollcommand=lambda first, last: self.sync_compare_xview("after", first, last)
         )
+
+    def toggle_compare_changes_only(self) -> None:
+        self.compare_changes_only_var.set(not self.compare_changes_only_var.get())
+        self.refresh_compare_filter_button()
+        self.refresh_comparison_preview()
+
+    def refresh_compare_filter_button(self) -> None:
+        if self.compare_changes_only_var.get():
+            self.compare_filter_button_text.set("显示全部")
+        else:
+            self.compare_filter_button_text.set("仅预览变动")
 
     def _create_compare_text_panel(
         self,
@@ -1439,6 +1487,12 @@ class SpreadsheetApp(BaseApp):
         self.compare_after_df = None
         self.compare_statuses = []
         self.compare_changed_columns = []
+        self.compare_all_before_df = None
+        self.compare_all_after_df = None
+        self.compare_all_statuses = []
+        self.compare_all_changed_columns = []
+        self.compare_before_total_rows = 0
+        self.compare_after_total_rows = 0
         self.compare_column_widths = {}
         self.hide_compare_tooltip()
         self.clear_compare_text(self.compare_before_text, self.compare_before_info_label, "暂无修改前预览")
@@ -1744,7 +1798,7 @@ class SpreadsheetApp(BaseApp):
         dataframe = self.data_cache[source_id]
         info = (
             f"{self.ROLE_TITLES[source.dataset_role]} / {source.path.name} / {source.sheet_name}"
-            f" | 行数: {len(dataframe)} | 列数: {len(dataframe.columns)} | 预览前 200 行"
+            f" | 行数: {len(dataframe)} | 列数: {len(dataframe.columns)} | 已加载全部"
         )
         self.populate_dataframe_preview(self.raw_tree, dataframe, self.raw_info_label, info)
 
@@ -1785,7 +1839,7 @@ class SpreadsheetApp(BaseApp):
                 self.processed_writeback_df = result.writeback_dataframe
                 self.last_processed_scope_source_ids = set(scoped_sources.keys())
                 self.prepare_comparison_preview(raw_dataframe_result, config, self.processed_df)
-                self.write_summary(result.summary_lines + summarize_comparison_statuses(self.compare_statuses))
+                self.write_summary(result.summary_lines + summarize_comparison_statuses(self.compare_all_statuses))
                 self.status_var.set(f"处理完成：当前结果 {len(self.processed_df)} 行")
                 if self.post_process_action is not None:
                     callback = self.post_process_action
@@ -2117,21 +2171,47 @@ class SpreadsheetApp(BaseApp):
         processed_df: pd.DataFrame,
     ) -> None:
         baseline_df = build_baseline_dataframe(raw_dataframe, list(processed_df.columns), config)
+        ignored_columns = get_ignored_compare_columns([str(column) for column in raw_dataframe.columns], config)
         comparison = align_for_comparison(
             baseline_df,
             processed_df,
             config,
             self.column_settings,
+            ignored_columns=ignored_columns,
         )
-        self.compare_before_df = comparison.before_df
-        self.compare_after_df = comparison.after_df
-        self.compare_statuses = comparison.statuses
-        self.compare_changed_columns = comparison.changed_columns
+        self.compare_all_before_df = comparison.before_df
+        self.compare_all_after_df = comparison.after_df
+        self.compare_all_statuses = comparison.statuses
+        self.compare_all_changed_columns = comparison.changed_columns
+        self.compare_before_total_rows = len(baseline_df)
+        self.compare_after_total_rows = len(processed_df)
+        self.refresh_comparison_preview()
+
+    def refresh_comparison_preview(self) -> None:
+        self.refresh_compare_filter_button()
+        if self.compare_all_before_df is None or self.compare_all_after_df is None:
+            return
+
+        (
+            self.compare_before_df,
+            self.compare_after_df,
+            self.compare_statuses,
+            self.compare_changed_columns,
+        ) = filter_comparison_rows(
+            self.compare_all_before_df,
+            self.compare_all_after_df,
+            self.compare_all_statuses,
+            self.compare_all_changed_columns,
+            changes_only=self.compare_changes_only_var.get(),
+        )
         self.populate_comparison_preview(
-            comparison.before_df,
-            comparison.after_df,
-            comparison.statuses,
-            comparison.changed_columns,
+            self.compare_before_df,
+            self.compare_after_df,
+            self.compare_statuses,
+            self.compare_changed_columns,
+            before_total_rows=self.compare_before_total_rows,
+            after_total_rows=self.compare_after_total_rows,
+            changes_only=self.compare_changes_only_var.get(),
         )
 
     def populate_comparison_preview(
@@ -2140,8 +2220,17 @@ class SpreadsheetApp(BaseApp):
         after_df: pd.DataFrame,
         statuses: list[str],
         changed_columns: list[set[str]],
+        before_total_rows: int,
+        after_total_rows: int,
+        changes_only: bool,
     ) -> None:
-        before_info, after_info = build_comparison_info(before_df, after_df)
+        displayed_rows = max(len(before_df), len(after_df))
+        before_info, after_info = build_comparison_info(
+            before_total_rows,
+            after_total_rows,
+            displayed_rows,
+            changes_only=changes_only,
+        )
         column_widths = self.compute_compare_column_widths(before_df, after_df)
         self.compare_column_widths = column_widths
         self.hide_compare_tooltip()
@@ -2168,12 +2257,11 @@ class SpreadsheetApp(BaseApp):
             text_widget.configure(state="disabled")
             return
 
-        preview = dataframe.head(200).copy()
-        columns = [str(column) for column in preview.columns]
+        columns = [str(column) for column in dataframe.columns]
         self.insert_compare_line(text_widget, columns, column_widths, header=True)
         self.insert_compare_separator(text_widget, columns, column_widths)
 
-        for row_index, row in enumerate(preview.itertuples(index=False, name=None)):
+        for row_index, row in enumerate(dataframe.itertuples(index=False, name=None)):
             status = statuses[row_index] if row_index < len(statuses) else "same"
             changed = changed_columns[row_index] if row_index < len(changed_columns) else set()
             for column, value in zip(columns, row):
@@ -2426,8 +2514,7 @@ class SpreadsheetApp(BaseApp):
             info_label.configure(text=info_text)
             return
 
-        preview = dataframe.head(200).copy()
-        self.tree_preview_frames[id(tree)] = preview
+        self.tree_preview_frames[id(tree)] = dataframe
         columns = [str(column) for column in dataframe.columns]
         tree["columns"] = columns
 
@@ -2435,7 +2522,7 @@ class SpreadsheetApp(BaseApp):
             tree.heading(column, text=column)
             tree.column(column, width=130, anchor="w", stretch=True)
 
-        for row in preview.itertuples(index=False, name=None):
+        for row in dataframe.itertuples(index=False, name=None):
             tree.insert("", "end", values=[self.preview_value(value) for value in row])
 
         info_label.configure(text=info_text)

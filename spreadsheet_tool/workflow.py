@@ -7,11 +7,9 @@ import pandas as pd
 
 from .models import SourceSelection
 from .processor import (
-    build_target_profiles,
     collect_target_columns,
     combine_enabled_sources,
     is_direct_header_match_complete,
-    suggest_source_to_target_mapping,
 )
 
 OK = "ok"
@@ -138,7 +136,6 @@ def build_mapping_session(
     if not target_columns:
         return MappingSession(target_columns=[], candidates=[])
 
-    target_profiles = build_target_profiles(dict(context_sources), dict(data_cache), target_columns)
     candidates: list[MappingCandidate] = []
     for source in sources_to_map:
         if source.dataset_role != "new":
@@ -148,11 +145,7 @@ def build_mapping_session(
             continue
 
         auto_confirmed, direct_mapping = is_direct_header_match_complete(dataframe.columns, target_columns)
-        suggested_mapping = direct_mapping if auto_confirmed else suggest_source_to_target_mapping(
-            dataframe,
-            target_columns,
-            target_profiles,
-        )
+        suggested_mapping = dict(direct_mapping)
         candidates.append(
             MappingCandidate(
                 source=source,
@@ -160,7 +153,7 @@ def build_mapping_session(
                 suggested_mapping=suggested_mapping,
                 direct_mapping=direct_mapping,
                 auto_confirmed=auto_confirmed,
-                can_auto_apply=bool(direct_mapping) and suggested_mapping == direct_mapping,
+                can_auto_apply=bool(direct_mapping) and auto_confirmed,
             )
         )
     return MappingSession(target_columns=target_columns, candidates=candidates)

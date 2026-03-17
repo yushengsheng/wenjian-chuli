@@ -171,13 +171,23 @@ UNMAPPED_TARGET = object()
 
 
 def default_visible(column_name: str, include_source_columns: bool = True) -> bool:
-    if column_name in INTERNAL_COLUMNS:
+    if canonical_internal_column_name(column_name) is not None:
         return include_source_columns
     return True
 
 
 def default_display_name(column_name: str) -> str:
     return DISPLAY_NAME_OVERRIDES.get(column_name, column_name)
+
+
+def canonical_internal_column_name(column_name: object) -> str | None:
+    text = str(column_name).strip()
+    if not text:
+        return None
+    for internal_column in INTERNAL_COLUMNS:
+        if text == internal_column or text == default_display_name(internal_column):
+            return internal_column
+    return None
 
 
 def load_sources_from_paths(
@@ -263,26 +273,18 @@ def materialize_dataframe(raw: pd.DataFrame) -> pd.DataFrame:
     if prepared.empty:
         return pd.DataFrame()
 
-    use_header = first_row_looks_like_header(prepared)
-    if use_header:
-        header_values = prepared.iloc[0].tolist()
-        body = prepared.iloc[1:].copy()
-        selected_indexes: list[int] = []
-        columns: list[str] = []
-        for index, value in enumerate(header_values):
-            column_series = body.iloc[:, index] if index < body.shape[1] else pd.Series(dtype=object)
-            has_named_header = not is_empty_value(value)
-            has_data = not is_empty_series(column_series).all() if not column_series.empty else False
-            if has_named_header or has_data:
-                selected_indexes.append(index)
-                columns.append(normalize_column_name(value, index))
-        dataframe = body.iloc[:, selected_indexes].copy() if selected_indexes else pd.DataFrame()
-        dataframe.columns = columns
-        return normalize_dataframe(dataframe, preserve_empty_columns=True)
-    else:
-        dataframe = prepared.copy()
-        dataframe.columns = [f"列{index + 1}" for index in range(dataframe.shape[1])]
-    return normalize_dataframe(dataframe)
+    header_values = prepared.iloc[0].tolist()
+    body = prepared.iloc[1:].copy()
+    selected_indexes: list[int] = []
+    columns: list[str] = []
+    for index, value in enumerate(header_values):
+        has_named_header = not is_empty_value(value)
+        if has_named_header:
+            selected_indexes.append(index)
+            columns.append(normalize_column_name(value, index))
+    dataframe = body.iloc[:, selected_indexes].copy() if selected_indexes else pd.DataFrame()
+    dataframe.columns = columns
+    return normalize_dataframe(dataframe, preserve_empty_columns=True)
 
 
 def normalize_dataframe(dataframe: pd.DataFrame, preserve_empty_columns: bool = False) -> pd.DataFrame:
@@ -304,6 +306,9 @@ def normalize_column_name(column_name: object, index: int) -> str:
     if column_name is None:
         return f"列{index + 1}"
     text = str(column_name).strip()
+    internal_column = canonical_internal_column_name(text)
+    if internal_column is not None:
+        return internal_column
     if text.lower() in EMPTY_TEXT_VALUES:
         return f"列{index + 1}"
     return text or f"列{index + 1}"
@@ -323,44 +328,7 @@ def make_unique_column_names(columns: list[str]) -> list[str]:
 
 
 def first_row_looks_like_header(raw: pd.DataFrame) -> bool:
-    sample = raw.head(3).copy()
-    if sample.empty:
-        return True
-
-    first_row = sample.iloc[0].tolist()
-    second_row = sample.iloc[1].tolist() if len(sample) > 1 else []
-
-    header_hits = sum(1 for value in first_row if header_alias_key(value))
-    first_patterns = [infer_value_kind(value) for value in first_row]
-    second_patterns = [infer_value_kind(value) for value in second_row]
-
-    first_strong = sum(1 for kind in first_patterns if kind not in WEAK_KINDS)
-    second_strong = sum(1 for kind in second_patterns if kind not in WEAK_KINDS)
-    same_strong = sum(
-        1
-        for first_kind, second_kind in zip(first_patterns, second_patterns)
-        if first_kind == second_kind and first_kind not in WEAK_KINDS
-    )
-    comparable_strong = min(first_strong, second_strong)
-
-    if len(sample) == 1:
-        if header_hits >= 1:
-            return True
-        if first_strong >= 1:
-            return False
-        return True
-
-    if header_hits >= 1 and first_strong <= second_strong:
-        return True
-    if comparable_strong >= 1 and same_strong >= comparable_strong:
-        return False
-    if second_strong >= 3 and first_strong >= max(2, int(second_strong * 0.6)):
-        return False
-    if same_strong >= 3:
-        return False
-    if first_strong == 0 and second_strong >= 2:
-        return True
-    return True
+    return not raw.empty
 
 
 def combine_enabled_sources(
@@ -417,6 +385,8 @@ def collect_available_columns(
             if not source.enabled:
                 continue
             for column in source.columns:
+                if canonical_internal_column_name(column) is not None:
+                    continue
                 if column in seen:
                     continue
                 seen.add(column)
@@ -437,6 +407,8 @@ def collect_target_columns(sources: dict[str, SourceSelection]) -> list[str]:
         if not source.enabled or source.dataset_role != "old":
             continue
         for column in source.columns:
+            if canonical_internal_column_name(column) is not None:
+                continue
             if column in seen:
                 continue
             seen.add(column)
@@ -471,8 +443,8 @@ def suggest_source_to_target_mapping(
     target_columns: list[str],
     target_profiles: dict[str, dict[str, object]],
 ) -> dict[str, str]:
-    suggested = suggest_target_to_source_mapping(dataframe, target_columns, target_profiles)
-    return {source_column: target_column for target_column, source_column in suggested.items()}
+    _ = target_profiles
+    return build_direct_source_to_target_mapping(dataframe.columns, target_columns)
 
 
 def build_direct_source_to_target_mapping(
@@ -554,18 +526,14 @@ def align_dataframe_to_target(
             aligned[target_column] = dataframe[source_column]
             used_sources.add(source_column)
             assigned_targets.add(target_column)
-
-    suggested_mapping = suggest_target_to_source_mapping(
-        dataframe,
-        target_columns,
-        target_profiles,
-        excluded_sources=used_sources,
-        excluded_targets=assigned_targets,
-    )
-    for target_column, source_column in suggested_mapping.items():
-        aligned[target_column] = dataframe[source_column]
-        used_sources.add(source_column)
-        assigned_targets.add(target_column)
+    elif not target_profiles:
+        direct_mapping = {}
+    else:
+        direct_mapping = build_direct_mapping(dataframe.columns, target_columns)
+        for target_column, source_column in direct_mapping.items():
+            aligned[target_column] = dataframe[source_column]
+            used_sources.add(source_column)
+            assigned_targets.add(target_column)
 
     for target_column in target_columns:
         if target_column not in aligned.columns:
@@ -577,37 +545,18 @@ def align_dataframe_to_target(
 def build_direct_mapping(source_columns: Iterable[object], target_columns: list[str]) -> dict[str, str]:
     mapping: dict[str, str] = {}
     used: set[str] = set()
-    target_by_normalized_name: dict[str, str] = {}
+    target_by_name: dict[str, str] = {}
     for column in target_columns:
-        normalized_name = normalize_header_text(str(column))
-        if normalized_name and normalized_name not in target_by_normalized_name:
-            target_by_normalized_name[normalized_name] = column
+        target_name = str(column).strip()
+        if target_name and target_name not in target_by_name:
+            target_by_name[target_name] = column
 
     for source_column in source_columns:
         source_text = str(source_column)
-        normalized_name = normalize_header_text(source_text)
-        if not normalized_name or normalized_name not in target_by_normalized_name:
+        source_name = source_text.strip()
+        if not source_name or source_name not in target_by_name:
             continue
-        target_column = target_by_normalized_name[normalized_name]
-        if target_column in mapping or source_text in used:
-            continue
-        mapping[target_column] = source_text
-        used.add(source_text)
-
-    target_by_alias = {
-        alias: column
-        for column in target_columns
-        for alias in [header_alias_key(column)]
-        if alias and column not in mapping
-    }
-    for source_column in source_columns:
-        source_text = str(source_column)
-        if source_text in used:
-            continue
-        alias = header_alias_key(source_column)
-        if not alias or alias not in target_by_alias:
-            continue
-        target_column = target_by_alias[alias]
+        target_column = target_by_name[source_name]
         if target_column in mapping or source_text in used:
             continue
         mapping[target_column] = source_text
@@ -820,9 +769,9 @@ def apply_duplicate_strategy(
         has_key_mask = has_key_mask | ~is_empty_series(dataframe[key])
 
     keyed_rows = dataframe[has_key_mask].copy()
-    blank_rows = dataframe[~has_key_mask].copy()
+    blank_rows = filter_blank_key_rows_by_strategy(dataframe[~has_key_mask].copy(), strategy)
     if keyed_rows.empty:
-        return dataframe.reset_index(drop=True)
+        return sort_duplicate_strategy_result(blank_rows)
 
     keyed_rows = keyed_rows.sort_values(INTERNAL_APPEND_ORDER, kind="mergesort")
     helper_columns = attach_normalized_key_columns(keyed_rows, valid_keys)
@@ -838,8 +787,22 @@ def apply_duplicate_strategy(
 
     deduped = deduped.drop(columns=helper_columns, errors="ignore")
     merged = pd.concat([deduped, blank_rows], ignore_index=True, sort=False)
-    merged = merged.sort_values(INTERNAL_APPEND_ORDER, kind="mergesort").reset_index(drop=True)
-    return merged
+    return sort_duplicate_strategy_result(merged)
+
+
+def filter_blank_key_rows_by_strategy(dataframe: pd.DataFrame, strategy: str) -> pd.DataFrame:
+    strategy = normalize_duplicate_strategy(strategy)
+    if dataframe.empty or strategy not in {"update_only", "fill_old_empty"}:
+        return dataframe
+    if INTERNAL_SOURCE_ROLE not in dataframe.columns:
+        return dataframe
+    return dataframe[dataframe[INTERNAL_SOURCE_ROLE] == "old"].copy()
+
+
+def sort_duplicate_strategy_result(dataframe: pd.DataFrame) -> pd.DataFrame:
+    if dataframe.empty or INTERNAL_APPEND_ORDER not in dataframe.columns:
+        return dataframe.reset_index(drop=True)
+    return dataframe.sort_values(INTERNAL_APPEND_ORDER, kind="mergesort").reset_index(drop=True)
 
 
 def attach_normalized_key_columns(dataframe: pd.DataFrame, keys: list[str]) -> list[str]:

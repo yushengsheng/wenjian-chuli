@@ -6,13 +6,19 @@ import pandas as pd
 
 from .comparison import preview_value
 
-PREVIEW_LIMIT = 200
+COLUMN_WIDTH_SAMPLE_LIMIT = 200
 
 
-def build_comparison_info(before_df: pd.DataFrame, after_df: pd.DataFrame) -> tuple[str, str]:
+def build_comparison_info(
+    before_total_rows: int,
+    after_total_rows: int,
+    displayed_rows: int,
+    changes_only: bool = False,
+) -> tuple[str, str]:
+    mode_text = "仅变动" if changes_only else "全部"
     return (
-        f"修改前 {len(before_df)} 行 | 预览前 {PREVIEW_LIMIT} 行",
-        f"修改后 {len(after_df)} 行 | 预览前 {PREVIEW_LIMIT} 行",
+        f"修改前 {before_total_rows} 行 | 当前显示 {displayed_rows} 行（{mode_text}）",
+        f"修改后 {after_total_rows} 行 | 当前显示 {displayed_rows} 行（{mode_text}）",
     )
 
 
@@ -24,10 +30,28 @@ def compute_compare_column_widths(before_df: pd.DataFrame, after_df: pd.DataFram
         for dataframe in (before_df, after_df):
             if column not in dataframe.columns:
                 continue
-            for value in dataframe[column].head(PREVIEW_LIMIT).tolist():
+            for value in dataframe[column].head(COLUMN_WIDTH_SAMPLE_LIMIT).tolist():
                 max_len = max(max_len, len(preview_value(value)))
         widths[column] = min(max(max_len + 2, 10), 28)
     return widths
+
+
+def filter_comparison_rows(
+    before_df: pd.DataFrame,
+    after_df: pd.DataFrame,
+    statuses: list[str],
+    changed_columns: list[set[str]],
+    changes_only: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[set[str]]]:
+    if not changes_only:
+        return before_df, after_df, statuses, changed_columns
+
+    visible_indexes = [index for index, status in enumerate(statuses) if status != "same"]
+    filtered_before = before_df.iloc[visible_indexes].reset_index(drop=True)
+    filtered_after = after_df.iloc[visible_indexes].reset_index(drop=True)
+    filtered_statuses = [statuses[index] for index in visible_indexes]
+    filtered_changed_columns = [changed_columns[index] for index in visible_indexes]
+    return filtered_before, filtered_after, filtered_statuses, filtered_changed_columns
 
 
 def marker_for_cell(status: str, side: str, column: str, changed_columns: set[str]) -> tuple[str, str | None]:
