@@ -3,9 +3,13 @@ from __future__ import annotations
 import os
 import re
 import shutil
+from contextlib import contextmanager
+from io import BytesIO
 from pathlib import Path
 from typing import Iterable
 from uuid import uuid4
+from xml.etree import ElementTree as ET
+from zipfile import BadZipFile, ZipFile
 
 import pandas as pd
 
@@ -48,6 +52,8 @@ AUTO_WIDTH_SAMPLE_LIMIT = 2000
 
 CSV_ENCODINGS = ("utf-8-sig", "utf-8", "gb18030", "gbk")
 EMPTY_TEXT_VALUES = {"", "nan", "none", "null", "nat", "<na>"}
+SPREADSHEET_MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+STYLES_XML_PATH = "xl/styles.xml"
 _INTEGERISH_TEXT = re.compile(r"^-?\d+\.0+$")
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 HEX_ADDRESS_PATTERN = re.compile(r"^0x[a-fA-F0-9]{40}$")
@@ -217,7 +223,7 @@ def load_sources_from_paths(
             cache[source_id] = dataframe
             continue
 
-        with pd.ExcelFile(path, engine="openpyxl") as workbook:
+        with open_excel_file(path) as workbook:
             for sheet_name in workbook.sheet_names:
                 raw = workbook.parse(
                     sheet_name=sheet_name,
@@ -240,6 +246,86 @@ def load_sources_from_paths(
     return sources, cache
 
 
+@contextmanager
+def open_excel_file(path: Path):
+    original_error: Exception | None = None
+    try:
+        with pd.ExcelFile(path, engine="openpyxl") as workbook:
+            yield workbook
+            return
+    except Exception as exc:
+        if not should_retry_excel_with_style_repair(path, exc):
+            raise
+        original_error = exc
+
+    repaired_workbook = repair_excel_styles_for_openpyxl(path)
+    if repaired_workbook is None or original_error is None:
+        raise original_error or ValueError(f"无法导入 Excel 文件: {path.name}")
+
+    try:
+        with pd.ExcelFile(repaired_workbook, engine="openpyxl") as workbook:
+            yield workbook
+    except Exception as exc:
+        raise ValueError(
+            f"无法导入 Excel 文件 {path.name}：已尝试兼容损坏的单元格填充样式，但仍然失败。原始错误: {original_error}"
+        ) from exc
+
+
+def should_retry_excel_with_style_repair(path: Path, exc: Exception) -> bool:
+    return path.suffix.lower() in {".xlsx", ".xlsm"} and "openpyxl.styles.fills.Fill" in str(exc)
+
+
+def repair_excel_styles_for_openpyxl(path: Path) -> BytesIO | None:
+    try:
+        with ZipFile(path) as source_zip:
+            try:
+                styles_xml = source_zip.read(STYLES_XML_PATH)
+            except KeyError:
+                return None
+
+            repaired_styles_xml = repair_stylesheet_empty_fill_nodes(styles_xml)
+            if repaired_styles_xml is None:
+                return None
+
+            rebuilt = BytesIO()
+            with ZipFile(rebuilt, mode="w") as target_zip:
+                for item in source_zip.infolist():
+                    payload = repaired_styles_xml if item.filename == STYLES_XML_PATH else source_zip.read(item.filename)
+                    target_zip.writestr(item, payload)
+            rebuilt.seek(0)
+            return rebuilt
+    except (BadZipFile, OSError, ET.ParseError):
+        return None
+
+
+def repair_stylesheet_empty_fill_nodes(styles_xml: bytes) -> bytes | None:
+    root = ET.fromstring(styles_xml)
+    fills = root.find(f"{{{SPREADSHEET_MAIN_NS}}}fills")
+    if fills is None:
+        return None
+
+    repaired = False
+    for fill in list(fills):
+        if xml_local_name(fill.tag) != "fill":
+            continue
+        if len(list(fill)) != 0:
+            continue
+        ET.SubElement(fill, f"{{{SPREADSHEET_MAIN_NS}}}patternFill")
+        repaired = True
+
+    if not repaired:
+        return None
+
+    ET.register_namespace("", SPREADSHEET_MAIN_NS)
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def xml_local_name(tag: str) -> str:
+    if "}" not in tag:
+        return tag
+    return tag.rsplit("}", 1)[-1]
+
+
 def read_delimited_file(path: Path, separator: str) -> pd.DataFrame:
     last_error: Exception | None = None
     for encoding in CSV_ENCODINGS:
@@ -255,13 +341,12 @@ def read_delimited_file(path: Path, separator: str) -> pd.DataFrame:
 
 
 def read_excel_sheet(path: Path, sheet_name: str) -> pd.DataFrame:
-    raw = pd.read_excel(
-        path,
-        sheet_name=sheet_name,
-        dtype=object,
-        engine="openpyxl",
-        header=None,
-    )
+    with open_excel_file(path) as workbook:
+        raw = workbook.parse(
+            sheet_name=sheet_name,
+            dtype=object,
+            header=None,
+        )
     return materialize_dataframe(raw)
 
 
@@ -781,7 +866,7 @@ def apply_duplicate_strategy(
     elif strategy == "keep_last":
         deduped = keyed_rows.drop_duplicates(subset=helper_columns, keep="last")
     elif strategy in {"update_and_append", "update_only", "fill_old_empty"}:
-        deduped = merge_keyed_rows_by_role(keyed_rows, helper_columns, valid_keys, strategy)
+        deduped = merge_rows_by_selected_key_match(keyed_rows, valid_keys, strategy)
     else:
         deduped = keyed_rows
 
@@ -792,7 +877,7 @@ def apply_duplicate_strategy(
 
 def filter_blank_key_rows_by_strategy(dataframe: pd.DataFrame, strategy: str) -> pd.DataFrame:
     strategy = normalize_duplicate_strategy(strategy)
-    if dataframe.empty or strategy not in {"update_only", "fill_old_empty"}:
+    if dataframe.empty or strategy not in {"update_and_append", "update_only", "fill_old_empty"}:
         return dataframe
     if INTERNAL_SOURCE_ROLE not in dataframe.columns:
         return dataframe
@@ -803,6 +888,143 @@ def sort_duplicate_strategy_result(dataframe: pd.DataFrame) -> pd.DataFrame:
     if dataframe.empty or INTERNAL_APPEND_ORDER not in dataframe.columns:
         return dataframe.reset_index(drop=True)
     return dataframe.sort_values(INTERNAL_APPEND_ORDER, kind="mergesort").reset_index(drop=True)
+
+
+def merge_rows_by_selected_key_match(
+    dataframe: pd.DataFrame,
+    key_columns: list[str],
+    strategy: str,
+) -> pd.DataFrame:
+    strategy = normalize_duplicate_strategy(strategy)
+    output_columns = list(dataframe.columns)
+    old_rows_df = dataframe[dataframe[INTERNAL_SOURCE_ROLE] == "old"].sort_values(INTERNAL_APPEND_ORDER, kind="mergesort")
+    new_rows_df = dataframe[dataframe[INTERNAL_SOURCE_ROLE] == "new"].sort_values(INTERNAL_APPEND_ORDER, kind="mergesort")
+
+    old_rows = [{column: row[column] for column in output_columns} for _, row in old_rows_df.iterrows()]
+    key_indexes = build_old_row_key_indexes(old_rows, key_columns)
+    unmatched_new_rows: list[dict[str, object]] = []
+
+    for _, new_series in new_rows_df.iterrows():
+        new_row = {column: new_series[column] for column in output_columns}
+        match_position = choose_best_old_row_match(old_rows, new_row, key_columns, key_indexes)
+        if match_position is None:
+            if strategy != "update_only":
+                unmatched_new_rows.append(new_row)
+            continue
+
+        old_row = old_rows[match_position]
+        old_append_order = old_row.get(INTERNAL_APPEND_ORDER)
+        merged_row = overlay_new_row(old_row, new_row, key_columns, strategy)
+        merged_row[INTERNAL_APPEND_ORDER] = old_append_order
+        old_rows[match_position] = merged_row
+        refresh_old_row_key_indexes(key_indexes, key_columns, old_row, merged_row, match_position)
+
+    rows = [*old_rows, *unmatched_new_rows]
+    if not rows:
+        return pd.DataFrame(columns=output_columns)
+    result = pd.DataFrame(rows, columns=output_columns)
+    return result.sort_values(INTERNAL_APPEND_ORDER, kind="mergesort").reset_index(drop=True)
+
+
+def build_old_row_key_indexes(
+    old_rows: list[dict[str, object]],
+    key_columns: list[str],
+) -> dict[str, dict[str, list[int]]]:
+    indexes: dict[str, dict[str, list[int]]] = {key: {} for key in key_columns}
+    for position, row in enumerate(old_rows):
+        for key in key_columns:
+            normalized = normalize_key_value(row.get(key))
+            if not normalized:
+                continue
+            indexes[key].setdefault(normalized, []).append(position)
+    return indexes
+
+
+def choose_best_old_row_match(
+    old_rows: list[dict[str, object]],
+    new_row: dict[str, object],
+    key_columns: list[str],
+    key_indexes: dict[str, dict[str, list[int]]],
+) -> int | None:
+    candidate_positions: set[int] = set()
+    for key in key_columns:
+        normalized = normalize_key_value(new_row.get(key))
+        if not normalized:
+            continue
+        candidate_positions.update(key_indexes.get(key, {}).get(normalized, []))
+
+    best_position: int | None = None
+    best_score = -1
+    best_order: object = None
+    for position in candidate_positions:
+        old_row = old_rows[position]
+        score = count_matching_row_keys(old_row, new_row, key_columns)
+        if score <= 0:
+            continue
+        append_order = old_row.get(INTERNAL_APPEND_ORDER)
+        if (
+            score > best_score
+            or best_position is None
+            or (score == best_score and compare_order_value(append_order, best_order) < 0)
+        ):
+            best_position = position
+            best_score = score
+            best_order = append_order
+    return best_position
+
+
+def count_matching_row_keys(
+    left_row: dict[str, object],
+    right_row: dict[str, object],
+    key_columns: list[str],
+) -> int:
+    score = 0
+    for key in key_columns:
+        left_value = normalize_key_value(left_row.get(key))
+        right_value = normalize_key_value(right_row.get(key))
+        if left_value and right_value and left_value == right_value:
+            score += 1
+    return score
+
+
+def compare_order_value(left: object, right: object) -> int:
+    if right is None:
+        return -1
+    if left is None:
+        return 1
+    return -1 if left < right else (1 if left > right else 0)
+
+
+def refresh_old_row_key_indexes(
+    key_indexes: dict[str, dict[str, list[int]]],
+    key_columns: list[str],
+    old_row: dict[str, object],
+    new_row: dict[str, object],
+    position: int,
+) -> None:
+    for key in key_columns:
+        old_value = normalize_key_value(old_row.get(key))
+        new_value = normalize_key_value(new_row.get(key))
+        if old_value == new_value:
+            continue
+        if old_value:
+            remove_old_row_key_index(key_indexes, key, old_value, position)
+        if new_value:
+            key_indexes.setdefault(key, {}).setdefault(new_value, []).append(position)
+
+
+def remove_old_row_key_index(
+    key_indexes: dict[str, dict[str, list[int]]],
+    key: str,
+    value: str,
+    position: int,
+) -> None:
+    positions = key_indexes.get(key, {}).get(value)
+    if not positions:
+        return
+    key_indexes[key][value] = [existing for existing in positions if existing != position]
+    if not key_indexes[key][value]:
+        key_indexes[key].pop(value, None)
 
 
 def attach_normalized_key_columns(dataframe: pd.DataFrame, keys: list[str]) -> list[str]:
@@ -940,7 +1162,7 @@ def overlay_new_row(
             continue
 
         if strategy in {"update_and_append", "update_only"}:
-            if values_differ(merged_row.get(column), new_value):
+            if not is_empty_value(new_value) and values_differ(merged_row.get(column), new_value):
                 merged_row[column] = new_value
         elif strategy == "fill_old_empty":
             if is_empty_value(merged_row.get(column)) and not is_empty_value(new_value):
@@ -1175,29 +1397,60 @@ def write_dataframe_to_existing_excel_sheet(
     settings: ExportSettings,
 ) -> None:
     from openpyxl import load_workbook
+    from openpyxl.cell.cell import MergedCell
     from openpyxl.utils.dataframe import dataframe_to_rows
 
     workbook = load_workbook(output_path, keep_vba=output_path.suffix.lower() == ".xlsm")
     excel_ready = prepare_dataframe_for_excel(dataframe)
     try:
-        sheet_index = len(workbook.sheetnames)
         if sheet_name in workbook.sheetnames:
-            sheet_index = workbook.sheetnames.index(sheet_name)
-            workbook.remove(workbook[sheet_name])
-
-        worksheet = workbook.create_sheet(title=sheet_name, index=sheet_index)
-        for row in dataframe_to_rows(excel_ready, index=False, header=True):
-            worksheet.append(row)
-
-        if settings.freeze_header:
-            worksheet.freeze_panes = "A2"
-        if settings.style_header and dataframe.shape[1] > 0:
-            apply_header_style(worksheet)
-        if settings.auto_width and dataframe.shape[1] > 0:
-            apply_auto_width(worksheet, dataframe)
+            worksheet = workbook[sheet_name]
+            clear_worksheet_values_preserve_structure(worksheet, MergedCell)
+            unmerge_ranges_overlapping_write_area(worksheet, len(excel_ready) + 1, len(excel_ready.columns))
+            write_rows_to_worksheet(worksheet, excel_ready, dataframe_to_rows)
+        else:
+            worksheet = workbook.create_sheet(title=sheet_name, index=len(workbook.sheetnames))
+            write_rows_to_worksheet(worksheet, excel_ready, dataframe_to_rows)
+            if settings.freeze_header:
+                worksheet.freeze_panes = "A2"
+            if settings.style_header and dataframe.shape[1] > 0:
+                apply_header_style(worksheet)
+            if settings.auto_width and dataframe.shape[1] > 0:
+                apply_auto_width(worksheet, dataframe)
         workbook.save(output_path)
     finally:
         workbook.close()
+
+
+def clear_worksheet_values_preserve_structure(worksheet: object, merged_cell_type: type[object]) -> None:
+    max_row = getattr(worksheet, "max_row", 0) or 0
+    max_column = getattr(worksheet, "max_column", 0) or 0
+    if max_row <= 0 or max_column <= 0:
+        return
+    for row in worksheet.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_column):
+        for cell in row:
+            if isinstance(cell, merged_cell_type):
+                continue
+            cell.value = None
+
+
+def unmerge_ranges_overlapping_write_area(worksheet: object, max_row: int, max_column: int) -> None:
+    if max_row <= 0 or max_column <= 0:
+        return
+    for merged_range in list(worksheet.merged_cells.ranges):
+        if (
+            merged_range.min_row <= max_row
+            and merged_range.max_row >= 1
+            and merged_range.min_col <= max_column
+            and merged_range.max_col >= 1
+        ):
+            worksheet.unmerge_cells(str(merged_range))
+
+
+def write_rows_to_worksheet(worksheet: object, dataframe: pd.DataFrame, dataframe_to_rows_func: object) -> None:
+    for row_index, row in enumerate(dataframe_to_rows_func(dataframe, index=False, header=True), start=1):
+        for column_index, value in enumerate(row, start=1):
+            worksheet.cell(row=row_index, column=column_index, value=value)
 
 
 def apply_header_style(worksheet: object) -> None:

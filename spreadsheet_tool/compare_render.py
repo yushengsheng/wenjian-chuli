@@ -7,6 +7,8 @@ import pandas as pd
 from .comparison import preview_value
 
 COLUMN_WIDTH_SAMPLE_LIMIT = 200
+PREVIEW_ROW_NUMBER_COLUMN = "__preview_row_number__"
+PREVIEW_ROW_NUMBER_LABEL = "行号"
 
 
 def build_comparison_info(
@@ -24,7 +26,9 @@ def build_comparison_info(
 
 def compute_compare_column_widths(before_df: pd.DataFrame, after_df: pd.DataFrame) -> dict[str, int]:
     columns = [str(column) for column in after_df.columns]
-    widths: dict[str, int] = {}
+    widths: dict[str, int] = {
+        PREVIEW_ROW_NUMBER_COLUMN: max(len(PREVIEW_ROW_NUMBER_LABEL), len(str(max(len(before_df), len(after_df), 1))))
+    }
     for column in columns:
         max_len = len(column)
         for dataframe in (before_df, after_df):
@@ -34,6 +38,16 @@ def compute_compare_column_widths(before_df: pd.DataFrame, after_df: pd.DataFram
                 max_len = max(max_len, len(preview_value(value)))
         widths[column] = min(max(max_len + 2, 10), 28)
     return widths
+
+
+def build_compare_display_columns(columns: list[str]) -> list[str]:
+    return [PREVIEW_ROW_NUMBER_COLUMN, *columns]
+
+
+def display_compare_column_name(column: str) -> str:
+    if column == PREVIEW_ROW_NUMBER_COLUMN:
+        return PREVIEW_ROW_NUMBER_LABEL
+    return column
 
 
 def filter_comparison_rows(

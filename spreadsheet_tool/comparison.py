@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections import defaultdict, deque
 from dataclasses import dataclass
+import re
 
 import pandas as pd
 
@@ -9,7 +11,6 @@ from .processor import (
     INTERNAL_COLUMNS,
     INTERNAL_SOURCE_ROLE,
     apply_column_settings,
-    apply_duplicate_strategy,
     canonical_internal_column_name,
     default_display_name,
     make_unique_rename_map,
@@ -33,6 +34,10 @@ def preview_value(value: object) -> str:
     except (TypeError, ValueError):
         pass
     text = str(value)
+    if not text.strip():
+        return ""
+    text = re.sub(r"[\r\n]+", " ", text)
+    text = text.strip()
     return text if len(text) <= 160 else f"{text[:157]}..."
 
 
@@ -41,12 +46,20 @@ def build_baseline_dataframe(
     processed_columns: list[str] | None,
     config: PipelineConfig,
 ) -> pd.DataFrame:
-    old_only = raw_dataframe[raw_dataframe[INTERNAL_SOURCE_ROLE] == "old"].copy()
+    old_only = build_baseline_source_dataframe(raw_dataframe, config)
     if old_only.empty:
         return pd.DataFrame(columns=processed_columns or [])
-    if config.duplicate_keys:
-        old_only = apply_duplicate_strategy(old_only, config.duplicate_keys, "keep_last")
     return apply_column_settings(old_only, config)
+
+
+def build_baseline_source_dataframe(
+    raw_dataframe: pd.DataFrame,
+    config: PipelineConfig,
+) -> pd.DataFrame:
+    old_only = raw_dataframe[raw_dataframe[INTERNAL_SOURCE_ROLE] == "old"].copy()
+    if old_only.empty:
+        return pd.DataFrame()
+    return old_only.loc[:, [column for column in old_only.columns if column not in INTERNAL_COLUMNS]].reset_index(drop=True)
 
 
 def align_for_comparison(
@@ -55,36 +68,48 @@ def align_for_comparison(
     config: PipelineConfig,
     column_settings: dict[str, ColumnSetting],
     ignored_columns: set[str] | None = None,
+    before_key_df: pd.DataFrame | None = None,
+    after_key_df: pd.DataFrame | None = None,
+    key_columns: list[str] | None = None,
 ) -> ComparisonPreview:
-    columns = list(after_df.columns)
+    columns = list(after_df.columns) or list(before_df.columns)
     if not columns:
         return ComparisonPreview(before_df.copy(), after_df.copy(), [], [])
 
-    key_columns = get_compare_key_columns(config, before_df, after_df, column_settings)
-    if not key_columns:
+    key_before = before_key_df.reset_index(drop=True) if before_key_df is not None else before_df.reset_index(drop=True)
+    key_after = after_key_df.reset_index(drop=True) if after_key_df is not None else after_df.reset_index(drop=True)
+    compare_key_columns = key_columns or get_compare_key_columns(
+        config,
+        key_before,
+        key_after,
+        column_settings,
+        use_output_names=before_key_df is None and after_key_df is None,
+    )
+    if not compare_key_columns:
         return align_by_index(before_df, after_df, columns, ignored_columns=ignored_columns)
 
-    before_groups = dataframe_to_key_groups(before_df, key_columns)
-    after_groups = dataframe_to_key_groups(after_df, key_columns)
-    ordered_keys = list(before_groups.keys()) + [key for key in after_groups if key not in before_groups]
+    row_pairs = build_comparison_row_pairs(
+        before_df,
+        after_df,
+        key_before,
+        key_after,
+        compare_key_columns,
+        ignored_columns=ignored_columns,
+    )
 
     before_rows: list[dict[str, object]] = []
     after_rows: list[dict[str, object]] = []
     statuses: list[str] = []
     changed_columns: list[set[str]] = []
 
-    for key in ordered_keys:
-        before_group = before_groups.get(key, [])
-        after_group = after_groups.get(key, [])
-        row_count = max(len(before_group), len(after_group))
-        for index in range(row_count):
-            before_row = before_group[index] if index < len(before_group) else empty_row(columns)
-            after_row = after_group[index] if index < len(after_group) else empty_row(columns)
-            status, changed = compare_row_values(before_row, after_row, columns, ignored_columns=ignored_columns)
-            before_rows.append(before_row)
-            after_rows.append(after_row)
-            statuses.append(status)
-            changed_columns.append(changed)
+    for before_index, after_index in row_pairs:
+        before_row = before_df.iloc[before_index].to_dict() if before_index is not None and before_index < len(before_df) else empty_row(columns)
+        after_row = after_df.iloc[after_index].to_dict() if after_index is not None and after_index < len(after_df) else empty_row(columns)
+        status, changed = compare_row_values(before_row, after_row, columns, ignored_columns=ignored_columns)
+        before_rows.append(before_row)
+        after_rows.append(after_row)
+        statuses.append(status)
+        changed_columns.append(changed)
 
     return ComparisonPreview(
         before_df=pd.DataFrame(before_rows, columns=columns),
@@ -99,12 +124,13 @@ def get_compare_key_columns(
     before_df: pd.DataFrame,
     after_df: pd.DataFrame,
     column_settings: dict[str, ColumnSetting],
+    use_output_names: bool = True,
 ) -> list[str]:
     output_key_columns: list[str] = []
     for original_key in config.duplicate_keys:
-        output_name = output_name_for_column(original_key, column_settings)
-        if output_name in before_df.columns and output_name in after_df.columns:
-            output_key_columns.append(output_name)
+        candidate_name = output_name_for_column(original_key, column_settings) if use_output_names else original_key
+        if candidate_name in before_df.columns and candidate_name in after_df.columns:
+            output_key_columns.append(candidate_name)
     return output_key_columns
 
 
@@ -123,6 +149,157 @@ def dataframe_to_key_groups(
         key = tuple(preview_value(row.get(column)) for column in key_columns)
         mapping.setdefault(key, []).append({column: row.get(column, "") for column in dataframe.columns})
     return mapping
+
+
+def build_comparison_row_pairs(
+    before_display_df: pd.DataFrame,
+    after_display_df: pd.DataFrame,
+    before_df: pd.DataFrame,
+    after_df: pd.DataFrame,
+    key_columns: list[str],
+    ignored_columns: set[str] | None = None,
+) -> list[tuple[int | None, int | None]]:
+    ignored_columns = ignored_columns or set()
+    unmatched_before = set(range(len(before_df)))
+    matched_after_to_before: dict[int, int] = {}
+    key_indexes = build_comparison_key_indexes(before_df, key_columns)
+
+    for after_index, (_, after_row) in enumerate(after_df.iterrows()):
+        candidate_before = choose_best_matching_comparison_row(
+            before_df,
+            after_row,
+            key_columns,
+            unmatched_before,
+            key_indexes,
+        )
+        if candidate_before is None:
+            continue
+        unmatched_before.remove(candidate_before)
+        matched_after_to_before[after_index] = candidate_before
+
+    unmatched_before_list = [index for index in range(len(before_df)) if index in unmatched_before]
+    unmatched_after_list = [index for index in range(len(after_df)) if index not in matched_after_to_before]
+    fallback_pairs = align_unmatched_rows_by_content(
+        before_display_df,
+        after_display_df,
+        unmatched_before_list,
+        unmatched_after_list,
+        ignored_columns=ignored_columns,
+    )
+
+    before_to_after = {before_index: after_index for after_index, before_index in matched_after_to_before.items()}
+    for before_index, after_index in fallback_pairs:
+        if before_index is not None:
+            before_to_after[before_index] = after_index
+
+    pairs: list[tuple[int | None, int | None]] = []
+    consumed_before: set[int] = set()
+    for after_index in range(len(after_df)):
+        matched_before = matched_after_to_before.get(after_index)
+        if matched_before is None:
+            matched_before = next(
+                (before_index for before_index, candidate_after in fallback_pairs if candidate_after == after_index),
+                None,
+            )
+        if matched_before is not None:
+            consumed_before.add(matched_before)
+        pairs.append((matched_before, after_index))
+
+    for before_index in range(len(before_df)):
+        if before_index not in consumed_before:
+            pairs.append((before_index, None))
+
+    return pairs
+
+
+def choose_best_matching_comparison_row(
+    before_df: pd.DataFrame,
+    after_row: pd.Series,
+    key_columns: list[str],
+    unmatched_before: set[int],
+    key_indexes: dict[str, dict[str, list[int]]],
+) -> int | None:
+    candidate_indexes: set[int] = set()
+    for key in key_columns:
+        after_value = preview_value(after_row.get(key))
+        if not after_value:
+            continue
+        candidate_indexes.update(key_indexes.get(key, {}).get(after_value, []))
+    if not candidate_indexes:
+        return None
+
+    best_index: int | None = None
+    best_score = -1
+    for before_index in candidate_indexes:
+        if before_index not in unmatched_before:
+            continue
+        before_row = before_df.iloc[before_index]
+        score = count_matching_compare_keys(before_row, after_row, key_columns)
+        if score <= 0:
+            continue
+        if score > best_score or best_index is None or before_index < best_index:
+            best_index = before_index
+            best_score = score
+    return best_index
+
+
+def count_matching_compare_keys(before_row: pd.Series, after_row: pd.Series, key_columns: list[str]) -> int:
+    score = 0
+    for key in key_columns:
+        before_value = preview_value(before_row.get(key))
+        after_value = preview_value(after_row.get(key))
+        if before_value and after_value and before_value == after_value:
+            score += 1
+    return score
+
+
+def build_comparison_key_indexes(
+    dataframe: pd.DataFrame,
+    key_columns: list[str],
+) -> dict[str, dict[str, list[int]]]:
+    indexes: dict[str, dict[str, list[int]]] = {key: {} for key in key_columns}
+    for index, (_, row) in enumerate(dataframe.iterrows()):
+        for key in key_columns:
+            value = preview_value(row.get(key))
+            if not value:
+                continue
+            indexes[key].setdefault(value, []).append(index)
+    return indexes
+
+
+def align_unmatched_rows_by_content(
+    before_df: pd.DataFrame,
+    after_df: pd.DataFrame,
+    before_indexes: list[int],
+    after_indexes: list[int],
+    ignored_columns: set[str] | None = None,
+) -> list[tuple[int | None, int | None]]:
+    ignored_columns = ignored_columns or set()
+    before_by_signature: dict[tuple[str, ...], deque[int]] = defaultdict(deque)
+    matched_before: set[int] = set()
+    pairs: list[tuple[int | None, int | None]] = []
+
+    for before_index in before_indexes:
+        signature = row_signature(before_df.iloc[before_index].to_dict(), ignored_columns)
+        before_by_signature[signature].append(before_index)
+
+    for after_index in after_indexes:
+        signature = row_signature(after_df.iloc[after_index].to_dict(), ignored_columns)
+        if before_by_signature[signature]:
+            matched_index = before_by_signature[signature].popleft()
+            matched_before.add(matched_index)
+            pairs.append((matched_index, after_index))
+        else:
+            pairs.append((None, after_index))
+
+    for before_index in before_indexes:
+        if before_index not in matched_before:
+            pairs.append((before_index, None))
+    return pairs
+
+
+def row_signature(row: dict[str, object], ignored_columns: set[str]) -> tuple[str, ...]:
+    return tuple(preview_value(value) for column, value in row.items() if column not in ignored_columns)
 
 
 def align_by_index(

@@ -5,8 +5,11 @@ import unittest
 import pandas as pd
 
 from spreadsheet_tool.compare_render import (
+    PREVIEW_ROW_NUMBER_COLUMN,
+    build_compare_display_columns,
     build_comparison_info,
     compute_compare_column_widths,
+    display_compare_column_name,
     filter_comparison_rows,
     fit_compare_text,
     marker_for_cell,
@@ -33,7 +36,12 @@ class CompareRenderTests(unittest.TestCase):
 
         widths = compute_compare_column_widths(before, after)
 
+        self.assertEqual(widths[PREVIEW_ROW_NUMBER_COLUMN], 2)
         self.assertEqual(widths["email"], 28)
+
+    def test_compare_display_columns_include_preview_row_number(self) -> None:
+        self.assertEqual(build_compare_display_columns(["email", "password"]), [PREVIEW_ROW_NUMBER_COLUMN, "email", "password"])
+        self.assertEqual(display_compare_column_name(PREVIEW_ROW_NUMBER_COLUMN), "行号")
 
     def test_filter_comparison_rows_keeps_only_non_same_rows(self) -> None:
         before = pd.DataFrame(

@@ -3,6 +3,8 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from zipfile import ZipFile
+from xml.etree import ElementTree as ET
 
 import pandas as pd
 
@@ -24,19 +26,75 @@ from spreadsheet_tool.processor import (
     collect_target_columns,
     default_display_name,
     export_dataframe_with_old_workbook,
+    load_sources_from_paths,
     materialize_dataframe,
     process_dataframe,
+    read_excel_sheet,
     values_differ,
     write_dataframe_to_existing_excel_sheet,
 )
 
 
 class ProcessorRegressionTests(unittest.TestCase):
+    def create_workbook_with_empty_fill_style(self, path: Path) -> Path:
+        from io import BytesIO
+
+        from openpyxl import Workbook, load_workbook
+
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = "Sheet1"
+        worksheet.append(["email", "note"])
+        worksheet.append(["a@example.com", "hello"])
+        workbook.save(path)
+        workbook.close()
+
+        namespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+        with ZipFile(path) as source_zip:
+            styles_root = ET.fromstring(source_zip.read("xl/styles.xml"))
+            fills = styles_root.find(f"{{{namespace}}}fills")
+            self.assertIsNotNone(fills)
+            assert fills is not None
+            fills.append(ET.Element(f"{{{namespace}}}fill"))
+            fills.set("count", str(len(list(fills))))
+
+            rebuilt_path = path.with_name(f"{path.stem}_broken{path.suffix}")
+            with ZipFile(rebuilt_path, mode="w") as target_zip:
+                for item in source_zip.infolist():
+                    payload = source_zip.read(item.filename)
+                    if item.filename == "xl/styles.xml":
+                        payload = ET.tostring(styles_root, encoding="utf-8", xml_declaration=True)
+                    target_zip.writestr(item, payload)
+
+        with self.assertRaisesRegex(TypeError, "openpyxl.styles.fills.Fill"):
+            load_workbook(BytesIO(rebuilt_path.read_bytes()), read_only=True, data_only=True)
+
+        return rebuilt_path
+
     def test_values_differ_uses_field_level_comparison_semantics(self) -> None:
         self.assertFalse(values_differ("same@example.com", "same@example.com"))
         self.assertFalse(values_differ(pd.NA, None))
         self.assertFalse(values_differ(1, 1.0))
         self.assertTrue(values_differ("old-pass", "new-pass"))
+
+    def test_load_sources_from_paths_repairs_empty_fill_stylesheet_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            broken_path = self.create_workbook_with_empty_fill_style(Path(tmp_dir) / "source.xlsx")
+
+            sources, cache = load_sources_from_paths([broken_path])
+
+        self.assertEqual(len(sources), 1)
+        source = sources[0]
+        self.assertEqual(source.sheet_name, "Sheet1")
+        self.assertEqual(cache[source.source_id].to_dict(orient="records"), [{"email": "a@example.com", "note": "hello"}])
+
+    def test_read_excel_sheet_repairs_empty_fill_stylesheet_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            broken_path = self.create_workbook_with_empty_fill_style(Path(tmp_dir) / "sheet.xlsx")
+
+            dataframe = read_excel_sheet(broken_path, "Sheet1")
+
+        self.assertEqual(dataframe.to_dict(orient="records"), [{"email": "a@example.com", "note": "hello"}])
 
     def test_materialize_dataframe_uses_first_non_empty_row_as_header_for_single_row_input(self) -> None:
         raw = pd.DataFrame([["a@example.com", "pw123456"]])
@@ -212,7 +270,7 @@ class ProcessorRegressionTests(unittest.TestCase):
             ["a@example.com", "b@example.com", "c@example.com", "d@example.com"],
         )
 
-    def test_update_and_append_overwrites_mapped_row_and_preserves_unmapped_old_columns(self) -> None:
+    def test_update_and_append_keeps_existing_value_when_new_cell_is_empty(self) -> None:
         old_source = SourceSelection(
             source_id="old",
             path=Path("old.xlsx"),
@@ -264,11 +322,139 @@ class ProcessorRegressionTests(unittest.TestCase):
         row_a = result.dataframe[result.dataframe["email"] == "a@example.com"].iloc[0]
         row_c = result.dataframe[result.dataframe["email"] == "c@example.com"].iloc[0]
         self.assertEqual(row_a["password"], "new-pass")
-        self.assertTrue(pd.isna(row_a["phone"]))
+        self.assertEqual(row_a["phone"], "0911000000")
         self.assertEqual(row_a["note"], "keep-note")
         self.assertEqual(row_c["password"], "c-pass")
         self.assertEqual(row_c["phone"], "0933000000")
         self.assertTrue(pd.isna(row_c["note"]))
+
+    def test_update_and_append_drops_new_rows_with_blank_primary_keys(self) -> None:
+        old_source = SourceSelection(
+            source_id="old",
+            path=Path("old.xlsx"),
+            sheet_name="Sheet1",
+            dataset_role="old",
+            columns=["email", "note"],
+            row_count=2,
+        )
+        new_source = SourceSelection(
+            source_id="new",
+            path=Path("new.xlsx"),
+            sheet_name="Sheet1",
+            dataset_role="new",
+            columns=["email", "note"],
+            row_count=2,
+            source_column_mapping={"email": "email", "note": "note"},
+            mapping_confirmed=True,
+        )
+        cache = {
+            "old": pd.DataFrame(
+                [
+                    {"email": "a@example.com", "note": "keep-a"},
+                    {"email": pd.NA, "note": "keep-old-blank"},
+                ]
+            ),
+            "new": pd.DataFrame(
+                [
+                    {"email": "b@example.com", "note": "append-b"},
+                    {"email": pd.NA, "note": "should-drop"},
+                ]
+            ),
+        }
+
+        combined = combine_enabled_sources({"old": old_source, "new": new_source}, cache)
+        result = process_dataframe(
+            combined,
+            PipelineConfig(
+                duplicate_keys=["email"],
+                duplicate_strategy="update_and_append",
+                include_source_columns=False,
+            ),
+        )
+
+        self.assertEqual(result.dataframe["email"].tolist(), ["a@example.com", pd.NA, "b@example.com"])
+        self.assertEqual(result.dataframe["note"].tolist(), ["keep-a", "keep-old-blank", "append-b"])
+
+    def test_update_and_append_matches_when_any_selected_key_matches(self) -> None:
+        dataframe = pd.DataFrame(
+            [
+                {
+                    "email": "a@example.com",
+                    "phone": "0911000000",
+                    "password": "old-pass",
+                    "note": "old-note",
+                    "__source_file": "old.xlsx",
+                    "__source_sheet": "Sheet1",
+                    "__source_role": "old",
+                    "__append_order": 1,
+                },
+                {
+                    "email": "a@example.com",
+                    "phone": pd.NA,
+                    "password": pd.NA,
+                    "note": "new-note",
+                    "__source_file": "new.xlsx",
+                    "__source_sheet": "Sheet1",
+                    "__source_role": "new",
+                    "__append_order": 2,
+                },
+            ]
+        )
+
+        result = process_dataframe(
+            dataframe,
+            PipelineConfig(
+                duplicate_keys=["email", "phone"],
+                duplicate_strategy="update_and_append",
+                include_source_columns=False,
+            ),
+        )
+
+        self.assertEqual(len(result.dataframe), 1)
+        row = result.dataframe.iloc[0]
+        self.assertEqual(row["email"], "a@example.com")
+        self.assertEqual(row["phone"], "0911000000")
+        self.assertEqual(row["password"], "old-pass")
+        self.assertEqual(row["note"], "new-note")
+
+    def test_update_and_append_keeps_new_duplicate_rows_when_no_old_row_matches(self) -> None:
+        dataframe = pd.DataFrame(
+            [
+                {
+                    "email": "dup@example.com",
+                    "note": "first-row",
+                    "password": pd.NA,
+                    "__source_file": "new.xlsx",
+                    "__source_sheet": "Sheet1",
+                    "__source_role": "new",
+                    "__append_order": 1,
+                },
+                {
+                    "email": "dup@example.com",
+                    "note": pd.NA,
+                    "password": "second-pass",
+                    "__source_file": "new.xlsx",
+                    "__source_sheet": "Sheet1",
+                    "__source_role": "new",
+                    "__append_order": 2,
+                },
+            ]
+        )
+
+        result = process_dataframe(
+            dataframe,
+            PipelineConfig(
+                duplicate_keys=["email"],
+                duplicate_strategy="update_and_append",
+                include_source_columns=False,
+            ),
+        )
+
+        self.assertEqual(result.writeback_dataframe["email"].tolist(), ["dup@example.com", "dup@example.com"])
+        self.assertEqual(result.writeback_dataframe.iloc[0]["note"], "first-row")
+        self.assertTrue(pd.isna(result.writeback_dataframe.iloc[1]["note"]))
+        self.assertTrue(pd.isna(result.writeback_dataframe.iloc[0]["password"]))
+        self.assertEqual(result.writeback_dataframe.iloc[1]["password"], "second-pass")
 
     def test_update_only_skips_missing_primary_keys(self) -> None:
         old_source = SourceSelection(
@@ -321,7 +507,7 @@ class ProcessorRegressionTests(unittest.TestCase):
         self.assertEqual(result.dataframe["email"].tolist(), ["a@example.com"])
         row_a = result.dataframe.iloc[0]
         self.assertEqual(row_a["password"], "new-pass")
-        self.assertTrue(pd.isna(row_a["phone"]))
+        self.assertEqual(row_a["phone"], "0911000000")
         self.assertEqual(row_a["note"], "keep-note")
 
     def test_update_only_drops_new_rows_with_blank_primary_keys(self) -> None:
@@ -437,6 +623,46 @@ class ProcessorRegressionTests(unittest.TestCase):
             finally:
                 workbook.close()
 
+    def test_write_dataframe_to_existing_excel_sheet_preserves_target_sheet_structure(self) -> None:
+        from openpyxl import Workbook, load_workbook
+        from openpyxl.styles import PatternFill
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_path = Path(tmp_dir) / "styled-writeback.xlsx"
+            workbook = Workbook()
+            worksheet = workbook.active
+            worksheet.title = "Sheet1"
+            worksheet["A1"] = "email"
+            worksheet["A2"] = "old@example.com"
+            worksheet["A2"].fill = PatternFill(fill_type="solid", fgColor="FF0000")
+            worksheet["A3"] = "stale@example.com"
+            worksheet.freeze_panes = "B2"
+            worksheet.column_dimensions["A"].width = 50
+            worksheet.merge_cells("C1:D1")
+            workbook.save(output_path)
+            workbook.close()
+
+            dataframe = pd.DataFrame([{"email": "new@example.com"}])
+            write_dataframe_to_existing_excel_sheet(
+                dataframe,
+                output_path,
+                "Sheet1",
+                ExportSettings(output_format="xlsx"),
+            )
+
+            workbook = load_workbook(output_path)
+            try:
+                worksheet = workbook["Sheet1"]
+                self.assertEqual(worksheet.freeze_panes, "B2")
+                self.assertEqual(worksheet.column_dimensions["A"].width, 50)
+                self.assertEqual([str(item) for item in worksheet.merged_cells.ranges], ["C1:D1"])
+                self.assertEqual(worksheet["A2"].fill.fill_type, "solid")
+                self.assertEqual(worksheet["A2"].fill.fgColor.rgb, "00FF0000")
+                self.assertEqual(worksheet["A2"].value, "new@example.com")
+                self.assertIsNone(worksheet["A3"].value)
+            finally:
+                workbook.close()
+
     def test_export_full_workbook_rejects_overwriting_source_file(self) -> None:
         from openpyxl import Workbook, load_workbook
 
@@ -471,6 +697,12 @@ class ComparisonRegressionTests(unittest.TestCase):
 
     def test_preview_value_treats_pd_na_as_empty(self) -> None:
         self.assertEqual(preview_value(pd.NA), "")
+
+    def test_preview_value_treats_newline_only_text_as_empty(self) -> None:
+        self.assertEqual(preview_value("\n"), "")
+
+    def test_preview_value_flattens_multiline_text_for_single_line_preview(self) -> None:
+        self.assertEqual(preview_value("line1\r\nline2\nline3"), "line1 line2 line3")
 
     def test_compare_row_values_treats_empty_and_pd_na_as_same(self) -> None:
         status, changed = compare_row_values({"email": None}, {"email": pd.NA}, ["email"])
@@ -548,6 +780,62 @@ class ComparisonRegressionTests(unittest.TestCase):
 
         self.assertEqual(comparison.statuses, ["same"])
         self.assertEqual(comparison.changed_columns, [set()])
+
+    def test_compare_preview_can_align_by_hidden_key_columns(self) -> None:
+        before_display = pd.DataFrame([{"备注": "old-a"}, {"备注": "old-b"}])
+        after_display = pd.DataFrame([{"备注": "old-a"}, {"备注": "new-c"}, {"备注": "old-b"}])
+        before_key_df = pd.DataFrame([{"email": "a@example.com"}, {"email": "b@example.com"}])
+        after_key_df = pd.DataFrame(
+            [
+                {"email": "a@example.com"},
+                {"email": "c@example.com"},
+                {"email": "b@example.com"},
+            ]
+        )
+
+        comparison = align_for_comparison(
+            before_display,
+            after_display,
+            PipelineConfig(duplicate_keys=["email"]),
+            {"email": ColumnSetting(visible=False)},
+            before_key_df=before_key_df,
+            after_key_df=after_key_df,
+            key_columns=["email"],
+        )
+
+        self.assertEqual(comparison.statuses, ["same", "added", "same"])
+        self.assertEqual(comparison.before_df.to_dict(orient="records"), [{"备注": "old-a"}, {"备注": ""}, {"备注": "old-b"}])
+        self.assertEqual(comparison.after_df.to_dict(orient="records"), [{"备注": "old-a"}, {"备注": "new-c"}, {"备注": "old-b"}])
+
+    def test_compare_preview_does_not_explode_when_most_rows_have_blank_selected_key(self) -> None:
+        before_display = pd.DataFrame(
+            [
+                {"备注": "same-1", "邮箱": "a@example.com"},
+                {"备注": "same-2", "邮箱": "b@example.com"},
+                {"备注": "old-mark", "邮箱": "c@example.com"},
+            ]
+        )
+        after_display = pd.DataFrame(
+            [
+                {"备注": "same-1", "邮箱": "a@example.com"},
+                {"备注": "same-2", "邮箱": "b@example.com"},
+                {"备注": "new-mark", "邮箱": "c@example.com"},
+            ]
+        )
+        before_key_df = pd.DataFrame([{"secret": ""}, {"secret": ""}, {"secret": "match-key"}])
+        after_key_df = pd.DataFrame([{"secret": ""}, {"secret": ""}, {"secret": "match-key"}])
+
+        comparison = align_for_comparison(
+            before_display,
+            after_display,
+            PipelineConfig(duplicate_keys=["secret"]),
+            {},
+            before_key_df=before_key_df,
+            after_key_df=after_key_df,
+            key_columns=["secret"],
+        )
+
+        self.assertEqual(comparison.statuses, ["same", "same", "changed"])
 
 
 if __name__ == "__main__":

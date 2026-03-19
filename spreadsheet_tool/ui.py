@@ -13,12 +13,17 @@ from .background_worker import BackgroundTaskResult, BackgroundWorker
 from .comparison import (
     align_for_comparison,
     build_baseline_dataframe,
+    build_baseline_source_dataframe,
     get_ignored_compare_columns,
     preview_value as format_preview_value,
 )
 from .compare_render import (
+    PREVIEW_ROW_NUMBER_COLUMN,
+    PREVIEW_ROW_NUMBER_LABEL,
+    build_compare_display_columns,
     build_comparison_info,
     compute_compare_column_widths,
+    display_compare_column_name,
     filter_comparison_rows,
     fit_compare_text,
     marker_for_cell,
@@ -38,6 +43,7 @@ from .processor import (
     FILTER_OPERATORS,
     INTERNAL_COLUMNS,
     UPDATE_MODES,
+    apply_column_settings,
     collect_target_columns,
     collect_available_columns,
     default_display_name,
@@ -144,6 +150,7 @@ class SpreadsheetApp(BaseApp):
         self.pending_ui_task: PendingUiTask | None = None
         self.post_process_action: object | None = None
         self.ui_busy = False
+        self.busy_progress: ttk.Progressbar | None = None
         self.close_after_task = False
         self.shutdown_started = False
         self.poll_after_id: str | None = None
@@ -261,6 +268,14 @@ class SpreadsheetApp(BaseApp):
                 widget.state(["!disabled"])
         for widget, normal_state in self.busy_tk_widgets:
             widget.configure(state="disabled" if busy else normal_state)
+        busy_progress = getattr(self, "busy_progress", None)
+        if busy_progress is not None:
+            if busy:
+                busy_progress.grid()
+                busy_progress.start(12)
+            else:
+                busy_progress.stop()
+                busy_progress.grid_remove()
         if status_text:
             self.status_var.set(status_text)
         self.update_idletasks()
@@ -559,9 +574,16 @@ class SpreadsheetApp(BaseApp):
         self._build_control_panel(control_frame)
         self.after(80, self._set_initial_pane_positions)
 
-        status_bar = ttk.Label(self, textvariable=self.status_var, relief=tk.GROOVE, anchor="w", padding=(8, 4))
-        status_bar.grid(row=2, column=0, sticky="ew")
+        status_frame = ttk.Frame(self, relief=tk.GROOVE, padding=(8, 4))
+        status_frame.grid(row=2, column=0, sticky="ew")
+        status_frame.columnconfigure(0, weight=1)
+        status_bar = ttk.Label(status_frame, textvariable=self.status_var, anchor="w")
+        status_bar.grid(row=0, column=0, sticky="ew")
         status_bar.configure(background="#eef2f7", foreground="#475467")
+        busy_progress = ttk.Progressbar(status_frame, mode="indeterminate", length=220)
+        busy_progress.grid(row=0, column=1, sticky="e", padx=(12, 0))
+        busy_progress.grid_remove()
+        self.busy_progress = busy_progress
 
     def _set_initial_pane_positions(self) -> None:
         self.update_idletasks()
@@ -906,8 +928,16 @@ class SpreadsheetApp(BaseApp):
         column_index = int(column_id.replace("#", "")) - 1
         preview_df = self.tree_preview_frames.get(id(tree))
         if preview_df is not None:
+            preview_columns = tree["columns"]
+            has_row_number_column = bool(preview_columns) and preview_columns[0] == PREVIEW_ROW_NUMBER_COLUMN
             item_index = tree.index(row_id)
+            if has_row_number_column and column_index == 0:
+                return str(item_index + 1)
+            if has_row_number_column:
+                column_index -= 1
             if 0 <= item_index < len(preview_df):
+                if column_index < 0 or column_index >= len(preview_df.columns):
+                    return ""
                 value = preview_df.iloc[item_index, column_index]
                 return "" if pd.isna(value) else str(value)
         if row_id in self.sources:
@@ -1167,7 +1197,7 @@ class SpreadsheetApp(BaseApp):
 
         ttk.Label(
             parent,
-            text="推荐默认策略是“更新并新增”：主键已存在时按字段比较，只更新有变化的字段；主键不存在时自动新增。若只想更新已存在记录、不新增，则改成“仅更新不新增”；若只想补空值，则改成“仅用新数据补全老数据空值”。",
+            text="推荐默认策略是“更新并新增”：主键已存在时按字段比较，只用新表里的非空值更新有变化的字段；主键不存在时自动新增。若只想更新已存在记录、不新增，则改成“仅更新不新增”；若只想补空值，则改成“仅用新数据补全老数据空值”。",
             wraplength=360,
             style="Summary.TLabel",
         ).grid(row=4, column=0, sticky="w", pady=(10, 0))
@@ -1602,8 +1632,13 @@ class SpreadsheetApp(BaseApp):
         dataframe = self.compare_before_df if side == "before" else self.compare_after_df
         x = int(getattr(event, "x", 0))
         y = int(getattr(event, "y", 0))
-        line, column_name = self.locate_compare_cell(text_widget, x, y, list(dataframe.columns))
-        if line is None or column_name is None:
+        line, column_name = self.locate_compare_cell(
+            text_widget,
+            x,
+            y,
+            build_compare_display_columns(list(dataframe.columns)),
+        )
+        if line is None or column_name is None or column_name == PREVIEW_ROW_NUMBER_COLUMN:
             self.hide_compare_tooltip()
             return
         row_index = line - 3
@@ -2170,7 +2205,9 @@ class SpreadsheetApp(BaseApp):
         config: PipelineConfig,
         processed_df: pd.DataFrame,
     ) -> None:
-        baseline_df = build_baseline_dataframe(raw_dataframe, list(processed_df.columns), config)
+        baseline_source_df = build_baseline_source_dataframe(raw_dataframe, config)
+        baseline_df = apply_column_settings(baseline_source_df, config)
+        after_source_df = self.processed_writeback_df.copy() if self.processed_writeback_df is not None else processed_df.copy()
         ignored_columns = get_ignored_compare_columns([str(column) for column in raw_dataframe.columns], config)
         comparison = align_for_comparison(
             baseline_df,
@@ -2178,6 +2215,9 @@ class SpreadsheetApp(BaseApp):
             config,
             self.column_settings,
             ignored_columns=ignored_columns,
+            before_key_df=baseline_source_df,
+            after_key_df=after_source_df,
+            key_columns=[key for key in config.duplicate_keys if key in baseline_source_df.columns and key in after_source_df.columns],
         )
         self.compare_all_before_df = comparison.before_df
         self.compare_all_after_df = comparison.after_df
@@ -2258,17 +2298,22 @@ class SpreadsheetApp(BaseApp):
             return
 
         columns = [str(column) for column in dataframe.columns]
-        self.insert_compare_line(text_widget, columns, column_widths, header=True)
-        self.insert_compare_separator(text_widget, columns, column_widths)
+        display_columns = build_compare_display_columns(columns)
+        self.insert_compare_line(text_widget, display_columns, column_widths, header=True)
+        self.insert_compare_separator(text_widget, display_columns, column_widths)
 
         for row_index, row in enumerate(dataframe.itertuples(index=False, name=None)):
             status = statuses[row_index] if row_index < len(statuses) else "same"
             changed = changed_columns[row_index] if row_index < len(changed_columns) else set()
-            for column, value in zip(columns, row):
-                display = self.preview_value(value)
-                marker, marker_tag = marker_for_cell(status, side, column, changed)
-                self.insert_compare_cell(text_widget, display, column_widths[column], marker, marker_tag)
-                if column != columns[-1]:
+            for display_index, column in enumerate(display_columns):
+                if column == PREVIEW_ROW_NUMBER_COLUMN:
+                    self.insert_compare_cell(text_widget, str(row_index + 1), column_widths[column], "", None)
+                else:
+                    value = row[display_index - 1]
+                    display = self.preview_value(value)
+                    marker, marker_tag = marker_for_cell(status, side, column, changed)
+                    self.insert_compare_cell(text_widget, display, column_widths[column], marker, marker_tag)
+                if column != display_columns[-1]:
                     text_widget.insert(tk.END, " | ", ("separator",))
             text_widget.insert(tk.END, "\n")
         text_widget.configure(state="disabled")
@@ -2281,7 +2326,7 @@ class SpreadsheetApp(BaseApp):
         header: bool = False,
     ) -> None:
         for index, column in enumerate(columns):
-            display = self.fit_compare_text(column, column_widths[column])
+            display = self.fit_compare_text(display_compare_column_name(column), column_widths[column])
             tag = "header" if header else ()
             text_widget.insert(tk.END, f"  {display}", tag)
             if index != len(columns) - 1:
@@ -2515,15 +2560,20 @@ class SpreadsheetApp(BaseApp):
             return
 
         self.tree_preview_frames[id(tree)] = dataframe
-        columns = [str(column) for column in dataframe.columns]
+        data_columns = [str(column) for column in dataframe.columns]
+        columns = [PREVIEW_ROW_NUMBER_COLUMN, *data_columns]
         tree["columns"] = columns
 
         for column in columns:
-            tree.heading(column, text=column)
-            tree.column(column, width=130, anchor="w", stretch=True)
+            if column == PREVIEW_ROW_NUMBER_COLUMN:
+                tree.heading(column, text=PREVIEW_ROW_NUMBER_LABEL)
+                tree.column(column, width=64, anchor="e", stretch=False)
+            else:
+                tree.heading(column, text=column)
+                tree.column(column, width=130, anchor="w", stretch=True)
 
-        for row in dataframe.itertuples(index=False, name=None):
-            tree.insert("", "end", values=[self.preview_value(value) for value in row])
+        for row_index, row in enumerate(dataframe.itertuples(index=False, name=None), start=1):
+            tree.insert("", "end", values=[str(row_index), *[self.preview_value(value) for value in row]])
 
         info_label.configure(text=info_text)
 
