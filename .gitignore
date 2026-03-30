@@ -7,6 +7,10 @@ release/
 .mypy_cache/
 .venv/
 venv/
+.logs/
+*.app/
+启动表格处理工具.applescript
+继续codex.applescript
 
 tmp_compare_test/
 tmp_mapping_test/
@@ -18,4 +22,3 @@ tmp_phone_test/
 2.xlsx
 华哥.xlsx
 账号总表.xlsx
-

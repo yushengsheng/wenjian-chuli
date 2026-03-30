@@ -50,6 +50,71 @@ def display_compare_column_name(column: str) -> str:
     return column
 
 
+def build_compare_text_content(
+    dataframe: pd.DataFrame,
+    statuses: list[str],
+    changed_columns: list[set[str]],
+    side: str,
+    column_widths: dict[str, int],
+) -> tuple[str, list[tuple[str, int, int]]]:
+    if dataframe is None or dataframe.empty:
+        return "", []
+
+    columns = [str(column) for column in dataframe.columns]
+    display_columns = build_compare_display_columns(columns)
+    parts: list[str] = []
+    tags: list[tuple[str, int, int]] = []
+    offset = 0
+
+    def append(text: str, *tag_names: str) -> None:
+        nonlocal offset
+        parts.append(text)
+        if not text:
+            return
+        start = offset
+        offset += len(text)
+        for tag_name in tag_names:
+            tags.append((tag_name, start, offset))
+
+    for index, column in enumerate(display_columns):
+        display = fit_compare_text(display_compare_column_name(column), column_widths[column])
+        append(f"  {display}", "header")
+        if index != len(display_columns) - 1:
+            append(" | ", "separator")
+    append("\n")
+
+    for index, column in enumerate(display_columns):
+        append("-" * (column_widths[column] + 2), "separator")
+        if index != len(display_columns) - 1:
+            append("-+-", "separator")
+    append("\n")
+
+    for row_index, row in enumerate(dataframe.itertuples(index=False, name=None)):
+        status = statuses[row_index] if row_index < len(statuses) else "same"
+        changed = changed_columns[row_index] if row_index < len(changed_columns) else set()
+        for display_index, column in enumerate(display_columns):
+            if column == PREVIEW_ROW_NUMBER_COLUMN:
+                append("  ")
+                append(fit_compare_text(str(row_index + 1), column_widths[column]))
+            else:
+                value = row[display_index - 1]
+                display = preview_value(value)
+                marker, marker_tag = marker_for_cell(status, side, column, changed)
+                if marker and marker_tag:
+                    append(marker, marker_tag)
+                    append(" ")
+                    value_tag = "plus_value" if marker_tag == "plus" else "minus_value"
+                    append(fit_compare_text(display, column_widths[column]), value_tag)
+                else:
+                    append("  ")
+                    append(fit_compare_text(display, column_widths[column]))
+            if column != display_columns[-1]:
+                append(" | ", "separator")
+        append("\n")
+
+    return "".join(parts), tags
+
+
 def filter_comparison_rows(
     before_df: pd.DataFrame,
     after_df: pd.DataFrame,

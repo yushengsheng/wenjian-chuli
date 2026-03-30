@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Iterable, Mapping
 
 from .models import SourceSelection
-from .processor import SUPPORTED_FILE_TYPES
+from .processor_common import SUPPORTED_FILE_TYPES
 
 PAIR_INCOMPLETE = "pair_incomplete"
 MISSING_OLD = "missing_old"

@@ -11,6 +11,7 @@ import pandas as pd
 from spreadsheet_tool.comparison import (
     align_for_comparison,
     compare_row_values,
+    full_preview_value,
     get_ignored_compare_columns,
     preview_value,
 )
@@ -703,6 +704,9 @@ class ComparisonRegressionTests(unittest.TestCase):
 
     def test_preview_value_flattens_multiline_text_for_single_line_preview(self) -> None:
         self.assertEqual(preview_value("line1\r\nline2\nline3"), "line1 line2 line3")
+
+    def test_full_preview_value_keeps_original_multiline_text(self) -> None:
+        self.assertEqual(full_preview_value("line1\r\nline2\nline3"), "line1\r\nline2\nline3")
 
     def test_compare_row_values_treats_empty_and_pd_na_as_same(self) -> None:
         status, changed = compare_row_values({"email": None}, {"email": pd.NA}, ["email"])

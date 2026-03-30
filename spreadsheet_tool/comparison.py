@@ -7,14 +7,8 @@ import re
 import pandas as pd
 
 from .models import ColumnSetting, PipelineConfig
-from .processor import (
-    INTERNAL_COLUMNS,
-    INTERNAL_SOURCE_ROLE,
-    apply_column_settings,
-    canonical_internal_column_name,
-    default_display_name,
-    make_unique_rename_map,
-)
+from .processor_common import INTERNAL_COLUMNS, INTERNAL_SOURCE_ROLE, canonical_internal_column_name, default_display_name
+from .processor_pipeline import apply_column_settings, make_unique_rename_map
 
 
 @dataclass(slots=True)
@@ -39,6 +33,17 @@ def preview_value(value: object) -> str:
     text = re.sub(r"[\r\n]+", " ", text)
     text = text.strip()
     return text if len(text) <= 160 else f"{text[:157]}..."
+
+
+def full_preview_value(value: object) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(value)
 
 
 def build_baseline_dataframe(

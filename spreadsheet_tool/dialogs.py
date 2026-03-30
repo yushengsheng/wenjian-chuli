@@ -7,14 +7,8 @@ from typing import TYPE_CHECKING
 import pandas as pd
 
 from .models import ColumnSetting, FilterRule, SourceSelection, UpdateRule
-from .processor import (
-    FILTER_OPERATORS,
-    INTERNAL_COLUMNS,
-    UPDATE_MODES,
-    default_display_name,
-    default_visible,
-    infer_source_column_kind,
-)
+from .processor_common import FILTER_OPERATORS, INTERNAL_COLUMNS, UPDATE_MODES, default_display_name, default_visible
+from .processor_mapping import infer_source_column_kind
 
 if TYPE_CHECKING:
     from .ui import SpreadsheetApp

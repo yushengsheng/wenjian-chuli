@@ -7,6 +7,7 @@ import pandas as pd
 from spreadsheet_tool.compare_render import (
     PREVIEW_ROW_NUMBER_COLUMN,
     build_compare_display_columns,
+    build_compare_text_content,
     build_comparison_info,
     compute_compare_column_widths,
     display_compare_column_name,
@@ -95,6 +96,23 @@ class CompareRenderTests(unittest.TestCase):
                 "比较摘要: 移除 0 行",
             ],
         )
+
+    def test_build_compare_text_content_returns_content_and_tags(self) -> None:
+        dataframe = pd.DataFrame([{"email": "before@example.com"}, {"email": "after@example.com"}])
+
+        content, tags = build_compare_text_content(
+            dataframe,
+            statuses=["changed", "added"],
+            changed_columns=[{"email"}, {"email"}],
+            side="after",
+            column_widths={PREVIEW_ROW_NUMBER_COLUMN: 2, "email": 18},
+        )
+
+        self.assertIn("行号", content)
+        self.assertIn("before@example.com", content)
+        self.assertIn("after@example.com", content)
+        self.assertTrue(any(tag_name == "plus" for tag_name, _, _ in tags))
+        self.assertTrue(any(tag_name == "plus_value" for tag_name, _, _ in tags))
 
 
 if __name__ == "__main__":

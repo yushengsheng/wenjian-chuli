@@ -6,11 +6,8 @@ from typing import Mapping
 import pandas as pd
 
 from .models import SourceSelection
-from .processor import (
-    collect_target_columns,
-    combine_enabled_sources,
-    is_direct_header_match_complete,
-)
+from .processor_mapping import collect_target_columns, is_direct_header_match_complete
+from .processor_pipeline import combine_enabled_sources
 
 OK = "ok"
 NO_DATA = "no_data"
